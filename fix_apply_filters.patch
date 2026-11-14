@@ -1,0 +1,18 @@
+"""
+Quick patch for apply_filters division by zero error
+Add this at the start of apply_filters function in dynamic_analyzer.py
+"""
+
+# Add this check at the start of apply_filters method
+if len(df) == 0:
+    self.logger.warning("No stocks to filter - input DataFrame is empty")
+    return df
+
+# Add this for safe percentage calculation
+# Replace the line with division:
+# f"({len(filtered)/initial_count*100:.1f}%)"
+# With:
+percentage = (len(filtered) / initial_count * 100) if initial_count > 0 else 0
+self.logger.info(
+    f"Filtering complete: {initial_count} → {len(filtered)} ({percentage:.1f}%)"
+)

@@ -1,0 +1,652 @@
+"""
+Enterprise Portfolio Manager
+src/portfolio/portfolio_manager.py
+
+Integrates Module 3 (Portfolio Construction) with Enterprise Features
+"""
+
+import pandas as pd
+import numpy as np
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+import yfinance as yf
+
+# Import enterprise components
+from src.core.config import ConfigManager
+from src.core.logging import LoggerFactory
+from src.core.errors import ErrorHandler, with_retry
+from src.utils.rate_limiter import RateLimiter
+
+
+class EnterprisePortfolioManager:
+    """
+    Enterprise Portfolio Construction & Management
+    
+    Features:
+    - Multiple allocation methods
+    - Transaction cost modeling
+    - Tax-efficient rebalancing (STCG/LTCG)
+    - Portfolio tracking
+    - Risk monitoring
+    - Performance analytics
+    """
+    
+    def __init__(self, db_path: str = None):
+        """Initialize portfolio manager"""
+        # Load configuration
+        self.config = ConfigManager()
+        self.db_path = ConfigManager().get('database.path')
+        
+        # Setup logging
+        self.logger = LoggerFactory.create_logger(
+            'portfolio_manager',
+            self.config,
+            context={'component': 'portfolio'}
+        )
+        
+        self.logger.info("Initializing Enterprise Portfolio Manager...")
+        
+        # Initialize components
+        self.error_handler = ErrorHandler(self.logger, self.config)
+        self.rate_limiter = RateLimiter(
+            calls_per_minute=self.config.get('api.rate_limit', 100)
+        )
+        
+        # Database
+        if db_path is None:
+            db_path = self.config.get('database.path')
+        
+        self.conn = sqlite3.connect(db_path)
+        # Enable foreign keys
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self._create_portfolio_tables()
+        
+        self.current_portfolio = None
+        
+        self.logger.info("OK Portfolio Manager initialized successfully")
+    
+    def _create_portfolio_tables(self):
+        """Create database tables for portfolio management"""
+        cursor = self.conn.cursor()
+        
+        # Portfolios table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS portfolios (
+                portfolio_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_name TEXT,
+                creation_date TEXT,
+                initial_capital REAL,
+                allocation_method TEXT,
+                num_stocks INTEGER,
+                status TEXT,
+                last_rebalance_date TEXT,
+                notes TEXT
+            )
+        ''')
+        
+        # Holdings table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS portfolio_holdings (
+                holding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER,
+                symbol TEXT,
+                entry_date TEXT,
+                entry_price REAL,
+                shares INTEGER,
+                invested_amount REAL,
+                target_weight REAL,
+                current_weight REAL,
+                unrealized_pnl REAL,
+                unrealized_pnl_pct REAL,
+                holding_period_days INTEGER,
+                tax_status TEXT,
+                FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
+            )
+        ''')
+        
+        # Transactions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS portfolio_transactions (
+                transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER,
+                symbol TEXT,
+                transaction_type TEXT,
+                transaction_date TEXT,
+                shares INTEGER,
+                price REAL,
+                amount REAL,
+                brokerage REAL,
+                tax REAL,
+                net_amount REAL,
+                notes TEXT,
+                FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
+            )
+        ''')
+        
+        # Performance tracking
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS portfolio_performance (
+                performance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id INTEGER,
+                date TEXT,
+                portfolio_value REAL,
+                invested_amount REAL,
+                cash_balance REAL,
+                total_pnl REAL,
+                total_pnl_pct REAL,
+                day_pnl REAL,
+                day_pnl_pct REAL,
+                FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
+            )
+        ''')
+        
+        self.conn.commit()
+        self.logger.info("OK Portfolio tables created/verified")
+    
+    def calculate_position_sizes(
+        self,
+        stocks_df: pd.DataFrame,
+        capital: float,
+        method: str = 'equal_weight',
+        max_position_size: float = None,
+        min_position_size: float = None
+    ) -> pd.DataFrame:
+        """
+        Calculate position sizes for selected stocks
+        
+        Args:
+            stocks_df: DataFrame with selected stocks and metrics
+            capital: Total capital to invest
+            method: 'equal_weight', 'momentum_weighted', 'risk_parity', 'volatility_weighted'
+            max_position_size: Maximum % of capital per stock
+            min_position_size: Minimum % of capital per stock
+        
+        Returns:
+            DataFrame with position sizes
+        """
+        if max_position_size is None:
+            max_position_size = self.config.get('trading.max_position_size', 0.15)
+        if min_position_size is None:
+            min_position_size = self.config.get('trading.min_position_size', 0.03)
+        
+        n_stocks = len(stocks_df)
+        positions = stocks_df.copy()
+        
+        self.logger.info(
+            f"Calculating positions: {n_stocks} stocks, ₹{capital:,.0f}, "
+            f"method={method}"
+        )
+        
+        if method == 'equal_weight':
+            target_weight = 1.0 / n_stocks
+            positions['target_weight'] = target_weight
+            positions['target_amount'] = capital * target_weight
+        
+        elif method == 'momentum_weighted':
+            if 'momentum_score' not in positions.columns:
+                self.logger.warning("momentum_score not found, using equal weight")
+                positions['target_weight'] = 1.0 / n_stocks
+                positions['target_amount'] = capital / n_stocks
+            else:
+                # Handle negative momentum
+                min_momentum = positions['momentum_score'].min()
+                if min_momentum < 0:
+                    adjusted_momentum = positions['momentum_score'] - min_momentum + 1
+                else:
+                    adjusted_momentum = positions['momentum_score']
+                
+                total_momentum = adjusted_momentum.sum()
+                positions['target_weight'] = adjusted_momentum / total_momentum
+                positions['target_amount'] = positions['target_weight'] * capital
+        
+        elif method == 'risk_parity':
+            # Find volatility column
+            vol_cols = [col for col in positions.columns if 'volatility' in col.lower()]
+            
+            if not vol_cols:
+                self.logger.warning("Volatility not found, using equal weight")
+                positions['target_weight'] = 1.0 / n_stocks
+                positions['target_amount'] = capital / n_stocks
+            else:
+                vol_col = vol_cols[0]
+                inv_vol = 1.0 / positions[vol_col]
+                total_inv_vol = inv_vol.sum()
+                positions['target_weight'] = inv_vol / total_inv_vol
+                positions['target_amount'] = positions['target_weight'] * capital
+        
+        elif method == 'volatility_weighted':
+            if 'momentum_score' in positions.columns:
+                vol_cols = [col for col in positions.columns if 'volatility' in col.lower()]
+                if vol_cols:
+                    vol_col = vol_cols[0]
+                    risk_adj = positions['momentum_score'] / positions[vol_col]
+                    
+                    min_ram = risk_adj.min()
+                    if min_ram <= 0:
+                        risk_adj = risk_adj - min_ram + 0.1
+                    
+                    total_ram = risk_adj.sum()
+                    positions['target_weight'] = risk_adj / total_ram
+                    positions['target_amount'] = positions['target_weight'] * capital
+                else:
+                    positions['target_weight'] = 1.0 / n_stocks
+                    positions['target_amount'] = capital / n_stocks
+            else:
+                positions['target_weight'] = 1.0 / n_stocks
+                positions['target_amount'] = capital / n_stocks
+        
+        # Apply constraints
+        positions['target_weight'] = positions['target_weight'].clip(
+            lower=min_position_size,
+            upper=max_position_size
+        )
+        
+        # Renormalize
+        total_weight = positions['target_weight'].sum()
+        positions['target_weight'] = positions['target_weight'] / total_weight
+        positions['target_amount'] = positions['target_weight'] * capital
+        
+        # Calculate shares
+        positions['shares'] = (positions['target_amount'] / positions['current_price']).astype(int)
+        positions['actual_amount'] = positions['shares'] * positions['current_price']
+        positions['actual_weight'] = positions['actual_amount'] / positions['actual_amount'].sum()
+        
+        # Display allocation
+        self._display_allocation(positions, capital)
+        
+        return positions
+    
+    def _display_allocation(self, positions: pd.DataFrame, capital: float):
+        """Display position allocation"""
+        print(f"\n{'='*80}")
+        print(f"POSITION ALLOCATION")
+        print(f"{'='*80}")
+        print(f"{'Symbol':<12} {'Target%':>8} {'Amount':>12} {'Shares':>8} {'Price':>10} {'Actual':>12}")
+        print(f"{'-'*80}")
+        
+        total_invested = 0
+        for _, row in positions.iterrows():
+            print(
+                f"{row['symbol']:<12} {row['target_weight']*100:>7.2f}% "
+                f"₹{row['target_amount']:>10,.0f} {row['shares']:>8} "
+                f"₹{row['current_price']:>9.2f} ₹{row['actual_amount']:>10,.0f}"
+            )
+            total_invested += row['actual_amount']
+        
+        cash_remaining = capital - total_invested
+        
+        print(f"{'-'*80}")
+        print(f"{'TOTAL INVESTED':<12} {total_invested/capital*100:>7.2f}% ₹{total_invested:>10,.0f}")
+        print(f"{'CASH REMAINING':<12} {cash_remaining/capital*100:>7.2f}% ₹{cash_remaining:>10,.0f}")
+        print(f"{'='*80}\n")
+    
+    def create_portfolio(
+        self,
+        positions_df: pd.DataFrame,
+        portfolio_name: str,
+        initial_capital: float,
+        allocation_method: str,
+        transaction_cost_pct: float = None
+    ) -> int:
+        """
+        Create a new portfolio
+        
+        Returns:
+            portfolio_id
+        """
+        if transaction_cost_pct is None:
+            transaction_cost_pct = self.config.get('trading.transaction_cost_pct', 0.0005)
+        
+        cursor = self.conn.cursor()
+        
+        self.logger.info(f"Creating portfolio: {portfolio_name}")
+        
+        # Create portfolio entry
+        cursor.execute('''
+            INSERT INTO portfolios 
+            (portfolio_name, creation_date, initial_capital, allocation_method,
+             num_stocks, status, last_rebalance_date, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            portfolio_name,
+            datetime.now().strftime('%Y-%m-%d'),
+            initial_capital,
+            allocation_method,
+            len(positions_df),
+            'ACTIVE',
+            datetime.now().strftime('%Y-%m-%d'),
+            'Portfolio created'
+        ))
+        
+        portfolio_id = cursor.lastrowid
+        
+        # Calculate costs
+        total_brokerage = 0
+        
+        # Add holdings and transactions
+        for _, row in positions_df.iterrows():
+            invested = row['actual_amount']
+            brokerage = invested * transaction_cost_pct
+            total_brokerage += brokerage
+            net_amount = invested + brokerage
+            
+            # Add holding
+            cursor.execute('''
+                INSERT INTO portfolio_holdings
+                (portfolio_id, symbol, entry_date, entry_price, shares,
+                 invested_amount, target_weight, current_weight,
+                 unrealized_pnl, unrealized_pnl_pct, holding_period_days, tax_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                portfolio_id,
+                row['symbol'],
+                datetime.now().strftime('%Y-%m-%d'),
+                row['current_price'],
+                int(row['shares']),
+                invested,
+                row['target_weight'],
+                row['actual_weight'],
+                0.0,
+                0.0,
+                0,
+                'STCG'
+            ))
+            
+            # Add transaction
+            cursor.execute('''
+                INSERT INTO portfolio_transactions
+                (portfolio_id, symbol, transaction_type, transaction_date,
+                 shares, price, amount, brokerage, tax, net_amount, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                portfolio_id,
+                row['symbol'],
+                'BUY',
+                datetime.now().strftime('%Y-%m-%d'),
+                int(row['shares']),
+                row['current_price'],
+                invested,
+                brokerage,
+                0.0,
+                net_amount,
+                'Initial purchase'
+            ))
+        
+        # Calculate totals
+        total_invested = positions_df['actual_amount'].sum()
+        cash_balance = initial_capital - total_invested - total_brokerage
+        
+        # Add performance record
+        cursor.execute('''
+            INSERT INTO portfolio_performance
+            (portfolio_id, date, portfolio_value, invested_amount,
+             cash_balance, total_pnl, total_pnl_pct, day_pnl, day_pnl_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            portfolio_id,
+            datetime.now().strftime('%Y-%m-%d'),
+            total_invested,
+            total_invested + total_brokerage,
+            cash_balance,
+            -total_brokerage,
+            -total_brokerage / (total_invested + total_brokerage) * 100,
+            0.0,
+            0.0
+        ))
+        
+        self.conn.commit()
+        
+        self.logger.info(
+            f"OK Portfolio created: ID={portfolio_id}, "
+            f"Invested=₹{total_invested:,.0f}, "
+            f"Costs=₹{total_brokerage:,.2f}"
+        )
+        
+        self.current_portfolio = portfolio_id
+        return portfolio_id
+    
+    @with_retry(max_attempts=3, backoff_factor=2.0)
+    def fetch_live_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """Fetch live prices for symbols"""
+        self.rate_limiter.acquire()
+        
+        prices = {}
+        
+        try:
+            tickers_str = ' '.join(symbols)
+            data = yf.download(tickers_str, period='1d', progress=False)
+            
+            if not data.empty:
+                if len(symbols) == 1:
+                    prices[symbols[0]] = data['Close'].iloc[-1]
+                else:
+                    for symbol in symbols:
+                        if symbol in data['Close'].columns:
+                            prices[symbol] = data['Close'][symbol].iloc[-1]
+            
+            self.logger.info(f"Fetched prices for {len(prices)}/{len(symbols)} symbols")
+            
+        except Exception as e:
+            self.error_handler.handle(
+                e,
+                context={'function': 'fetch_live_prices', 'symbols_count': len(symbols)}
+            )
+            raise
+        
+        return prices
+    
+    def track_portfolio_live(self, portfolio_id: int, save_snapshot: bool = True) -> Dict:
+        """
+        Track portfolio with live prices
+        
+        Returns:
+            Portfolio status dictionary
+        """
+        cursor = self.conn.cursor()
+        
+        # Get holdings
+        cursor.execute('''
+            SELECT symbol, entry_date, entry_price, shares, invested_amount,
+                   target_weight
+            FROM portfolio_holdings
+            WHERE portfolio_id = ?
+        ''', [portfolio_id])
+        
+        holdings = cursor.fetchall()
+        
+        if not holdings:
+            self.logger.warning(f"No holdings found for portfolio {portfolio_id}")
+            return None
+        
+        # Fetch live prices
+        symbols = [h[0] for h in holdings]
+        live_prices = self.fetch_live_prices(symbols)
+        
+        # Calculate current values
+        total_current_value = 0
+        total_invested = 0
+        holdings_data = []
+        
+        for holding in holdings:
+            symbol, entry_date, entry_price, shares, invested, target_weight = holding
+            
+            if symbol in live_prices:
+                current_price = live_prices[symbol]
+                current_value = shares * current_price
+                unrealized_pnl = current_value - invested
+                unrealized_pnl_pct = (unrealized_pnl / invested) * 100
+                
+                # Calculate holding period
+                entry_date_obj = datetime.strptime(entry_date, '%Y-%m-%d')
+                holding_days = (datetime.now() - entry_date_obj).days
+                tax_status = 'LTCG' if holding_days >= 365 else 'STCG'
+                
+                holdings_data.append({
+                    'symbol': symbol,
+                    'shares': shares,
+                    'entry_price': entry_price,
+                    'current_price': current_price,
+                    'invested': invested,
+                    'current_value': current_value,
+                    'unrealized_pnl': unrealized_pnl,
+                    'unrealized_pnl_pct': unrealized_pnl_pct,
+                    'holding_days': holding_days,
+                    'tax_status': tax_status,
+                    'current_weight': 0
+                })
+                
+                total_current_value += current_value
+                total_invested += invested
+                
+                # Update in database
+                cursor.execute('''
+                    UPDATE portfolio_holdings
+                    SET unrealized_pnl = ?,
+                        unrealized_pnl_pct = ?,
+                        holding_period_days = ?,
+                        tax_status = ?
+                    WHERE portfolio_id = ? AND symbol = ?
+                ''', (unrealized_pnl, unrealized_pnl_pct, holding_days,
+                      tax_status, portfolio_id, symbol))
+        
+        # Update current weights
+        for holding in holdings_data:
+            holding['current_weight'] = holding['current_value'] / total_current_value
+        
+        # Get portfolio info
+        cursor.execute('''
+            SELECT portfolio_name, creation_date
+            FROM portfolios WHERE portfolio_id = ?
+        ''', [portfolio_id])
+        
+        portfolio_info = cursor.fetchone()
+        
+        # Calculate day change (if previous snapshot exists)
+        cursor.execute('''
+            SELECT portfolio_value FROM portfolio_performance
+            WHERE portfolio_id = ?
+            ORDER BY date DESC LIMIT 1
+        ''', [portfolio_id])
+        
+        prev_snapshot = cursor.fetchone()
+        prev_value = prev_snapshot[0] if prev_snapshot else total_invested
+        
+        day_change = total_current_value - prev_value
+        day_change_pct = (day_change / prev_value * 100) if prev_value > 0 else 0
+        
+        # Save snapshot if requested
+        if save_snapshot:
+            cursor.execute('''
+                INSERT INTO portfolio_performance
+                (portfolio_id, date, portfolio_value, invested_amount,
+                 cash_balance, total_pnl, total_pnl_pct, day_pnl, day_pnl_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                portfolio_id,
+                datetime.now().strftime('%Y-%m-%d'),
+                total_current_value,
+                total_invested,
+                0,
+                total_current_value - total_invested,
+                ((total_current_value - total_invested) / total_invested * 100),
+                day_change,
+                day_change_pct
+            ))
+        
+        self.conn.commit()
+        
+        # Prepare status
+        status = {
+            'portfolio_id': portfolio_id,
+            'portfolio_name': portfolio_info[0] if portfolio_info else 'Unknown',
+            'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_invested': total_invested,
+            'total_current_value': total_current_value,
+            'unrealized_pnl': total_current_value - total_invested,
+            'unrealized_pnl_pct': ((total_current_value - total_invested) / total_invested * 100),
+            'day_change': day_change,
+            'day_change_pct': day_change_pct,
+            'num_holdings': len(holdings_data),
+            'holdings': holdings_data
+        }
+        
+        self.logger.info(
+            f"Portfolio {portfolio_id} tracked: "
+            f"Value=₹{total_current_value:,.0f}, "
+            f"P&L={status['unrealized_pnl_pct']:+.2f}%"
+        )
+        
+        return status
+    
+    def get_portfolio_summary(self, portfolio_id: int) -> Dict:
+        """Get comprehensive portfolio summary"""
+        status = self.track_portfolio_live(portfolio_id, save_snapshot=False)
+        
+        if not status:
+            return None
+        
+        print(f"\n{'='*100}")
+        print(f"PORTFOLIO SUMMARY: {status['portfolio_name']}")
+        print(f"{'='*100}")
+        print(f"Updated: {status['update_time']}")
+        print(f"\nPERFORMANCE:")
+        print(f"  Total Invested:  ₹{status['total_invested']:>12,.0f}")
+        print(f"  Current Value:   ₹{status['total_current_value']:>12,.0f}")
+        print(f"  Unrealized P&L:  ₹{status['unrealized_pnl']:>12,.0f} ({status['unrealized_pnl_pct']:+.2f}%)")
+        print(f"  Day Change:      ₹{status['day_change']:>12,.0f} ({status['day_change_pct']:+.2f}%)")
+        
+        print(f"\nHOLDINGS ({status['num_holdings']} stocks):")
+        print(f"{'-'*100}")
+        print(f"{'Symbol':<12} {'Shares':>8} {'Entry':>10} {'Current':>10} {'Invested':>12} {'Value':>12} {'P&L%':>8} {'Tax':>5}")
+        print(f"{'-'*100}")
+        
+        for holding in status['holdings']:
+            print(
+                f"{holding['symbol']:<12} {holding['shares']:>8} "
+                f"₹{holding['entry_price']:>9.2f} ₹{holding['current_price']:>9.2f} "
+                f"₹{holding['invested']:>10,.0f} ₹{holding['current_value']:>10,.0f} "
+                f"{holding['unrealized_pnl_pct']:>7.2f}% {holding['tax_status']:>5}"
+            )
+        
+        print(f"{'='*100}\n")
+        
+        return status
+    
+    def close(self):
+        """Close database connection"""
+        self.conn.close()
+        self.logger.info("Portfolio Manager closed")
+
+
+# Usage example
+if __name__ == "__main__":
+    pm = EnterprisePortfolioManager()
+    
+    # Sample stocks data
+    sample_stocks = pd.DataFrame({
+        'symbol': ['RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS', 'ICICIBANK.NS'],
+        'momentum_score': [45.2, 38.7, 42.1, 35.8, 40.5],
+        'volatility': [28.5, 22.3, 25.1, 24.8, 32.1],
+        'current_price': [2450.50, 3820.75, 1650.25, 1580.60, 1020.80]
+    })
+    
+    # Calculate positions
+    positions = pm.calculate_position_sizes(
+        sample_stocks,
+        capital=1000000,
+        method='risk_parity'
+    )
+    
+    # Create portfolio
+    portfolio_id = pm.create_portfolio(
+        positions,
+        portfolio_name='Demo Momentum Portfolio',
+        initial_capital=1000000,
+        allocation_method='risk_parity'
+    )
+    
+    # Track portfolio
+    pm.get_portfolio_summary(portfolio_id)
+    
+    pm.close()

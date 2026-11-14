@@ -1,0 +1,33 @@
+{
+  "config_name": "Aggressive",
+  "universe": "NIFTY500",
+  "custom_symbols": null,
+  "performance_periods": {
+    "6M": {
+      "days": 126,
+      "weight": 0.7
+    },
+    "3M": {
+      "days": 63,
+      "weight": 0.3
+    }
+  },
+  "volatility_periods": {
+    "3M_vol": 63
+  },
+  "momentum_weights": {
+    "6M": 0.7,
+    "3M": 0.3
+  },
+  "filters": {
+    "volume": {
+      "min_value": 50000
+    },
+    "volatility": {
+      "max_value": 80
+    },
+    "momentum": {
+      "min_value": 15
+    }
+  }
+}

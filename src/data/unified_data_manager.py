@@ -1,0 +1,898 @@
+"""
+Unified Enterprise Data Manager
+Combines best features from both implementations
+"""
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import sqlite3
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Tuple
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+
+from src.core.config import ConfigManager
+from src.core.logging import LoggerFactory
+from src.core.errors import ErrorHandler, with_retry
+from src.core.validation import DataValidator
+from src.utils.rate_limiter import RateLimiter
+
+
+class UnifiedDataManager:
+    """
+    Unified Enterprise Data Manager
+    
+    Combines:
+    - Enhanced caching and batch processing
+    - Original NSE-specific features (ISIN, series, listing date)
+    - Comprehensive quality tracking
+    - Failed update retry mechanism
+    """
+    
+    def __init__(self, db_path: str = None):
+        """Initialize unified data manager"""
+        # Load configuration
+        self.config = ConfigManager()
+        
+        # Setup logging
+        self.logger = LoggerFactory.create_logger(
+            'unified_data_manager',
+            self.config,
+            context={'component': 'data'}
+        )
+        
+        self.logger.info("Initializing Unified Data Manager...")
+        
+        # Initialize components
+        self.error_handler = ErrorHandler(self.logger, self.config)
+        self.validator = DataValidator(self.logger, self.config)
+        self.rate_limiter = RateLimiter(
+            calls_per_minute=self.config.get('api.rate_limit', 100)
+        )
+        
+        # Database
+        if db_path is None:
+            db_path = self.config.get('database.path')
+        
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        
+        # Enable foreign keys
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        
+        # Statistics
+        self.stats = {
+            'total_updates': 0,
+            'successful_updates': 0,
+            'failed_updates': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
+        }
+        
+        self._create_unified_tables()
+        
+        self.logger.info("OK Unified Data Manager initialized")
+    
+    def _create_unified_tables(self):
+        """Create unified database schema"""
+        cursor = self.conn.cursor()
+        
+        # ========================================================================
+        # STOCKS TABLE - Combines both versions
+        # ========================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stocks (
+                symbol TEXT PRIMARY KEY,
+                company_name TEXT,
+                sector TEXT,
+                industry TEXT,
+                
+                -- Market data
+                market_cap REAL,
+                market_cap_cr REAL,  -- Market cap in crores (for display)
+                
+                -- NSE-specific
+                isin TEXT,
+                series TEXT DEFAULT 'EQ',
+                listing_date TEXT,
+                
+                -- Index membership
+                index_membership TEXT,
+                
+                -- Status and quality
+                is_active INTEGER DEFAULT 1,
+                data_quality_score REAL,
+                
+                -- Update tracking
+                last_update_date TEXT,
+                update_frequency TEXT DEFAULT 'daily',
+                
+                -- Metadata
+                notes TEXT,
+                created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_modified TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # ========================================================================
+        # PRICE DATA TABLE - Enhanced version with foreign key
+        # ========================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                date TEXT NOT NULL,
+                
+                -- OHLCV data
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                adj_close REAL,
+                volume INTEGER,
+                
+                -- Quality tracking
+                validated INTEGER DEFAULT 0,
+                quality_score REAL,
+                quality_level TEXT,
+                
+                -- Metadata
+                data_source TEXT DEFAULT 'yfinance',
+                created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                
+                UNIQUE(symbol, date),
+                FOREIGN KEY (symbol) REFERENCES stocks(symbol) ON DELETE CASCADE
+            )
+        ''')
+        
+        # ========================================================================
+        # DATA QUALITY HISTORY - Track quality over time
+        # ========================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS data_quality_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                check_date TEXT NOT NULL,
+                
+                -- Quality metrics
+                quality_level TEXT,
+                quality_score REAL,
+                total_records INTEGER,
+                missing_records INTEGER,
+                duplicate_records INTEGER,
+                outliers INTEGER,
+                date_gaps INTEGER,
+                
+                -- Date range
+                first_date TEXT,
+                last_date TEXT,
+                
+                -- Issues
+                issues TEXT,
+                
+                -- Metadata
+                created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                
+                FOREIGN KEY (symbol) REFERENCES stocks(symbol) ON DELETE CASCADE
+            )
+        ''')
+        
+        # ========================================================================
+        # UPDATE HISTORY - Track batch updates
+        # ========================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS update_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                update_date TEXT NOT NULL,
+                update_type TEXT,  -- 'daily', 'historical', 'manual'
+                
+                -- Statistics
+                symbols_attempted INTEGER,
+                symbols_successful INTEGER,
+                symbols_failed INTEGER,
+                duration_seconds REAL,
+                
+                -- Details
+                errors TEXT,
+                notes TEXT,
+                
+                created_date TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # ========================================================================
+        # FAILED UPDATES - Track and retry
+        # ========================================================================
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS failed_updates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                
+                -- Failure tracking
+                failure_date TEXT NOT NULL,
+                failure_count INTEGER DEFAULT 1,
+                last_error TEXT,
+                
+                -- Retry management
+                retry_scheduled INTEGER DEFAULT 1,
+                last_retry_date TEXT,
+                next_retry_date TEXT,
+                
+                -- Status
+                status TEXT DEFAULT 'pending',  -- pending, retrying, resolved, abandoned
+                
+                created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_modified TEXT DEFAULT CURRENT_TIMESTAMP,
+                
+                UNIQUE(symbol, status)
+            )
+        ''')
+        
+        # ========================================================================
+        # INDEXES for performance
+        # ========================================================================
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_symbol ON price_data(symbol)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_date ON price_data(date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_symbol_date ON price_data(symbol, date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_stocks_active ON stocks(is_active)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_stocks_index ON stocks(index_membership)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_quality_history_symbol ON data_quality_history(symbol)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_failed_status ON failed_updates(status)')
+        
+        self.conn.commit()
+        self.logger.info("OK Unified database schema created/verified")
+    
+    # ========================================================================
+    # STOCK LIST MANAGEMENT
+    # ========================================================================
+    
+    def get_stock_list(self, index_name: str = 'NIFTY500') -> List[Dict]:
+        """Get stock list from database or fetch if needed"""
+        cursor = self.conn.cursor()
+        
+        # Try database first
+        if index_name == 'ALL':
+            cursor.execute('''
+                SELECT symbol, company_name, sector, industry, 
+                       isin, series, index_membership
+                FROM stocks 
+                WHERE is_active = 1
+                ORDER BY symbol
+            ''')
+        else:
+            cursor.execute('''
+                SELECT symbol, company_name, sector, industry,
+                       isin, series, index_membership
+                FROM stocks 
+                WHERE is_active = 1 
+                  AND (index_membership LIKE ? OR index_membership IS NULL)
+                ORDER BY symbol
+            ''', [f'%{index_name}%'])
+        
+        stocks = []
+        for row in cursor.fetchall():
+            stocks.append({
+                'symbol': row[0],
+                'company_name': row[1] or '',
+                'sector': row[2] or '',
+                'industry': row[3] or '',
+                'isin': row[4] or '',
+                'series': row[5] or 'EQ',
+                'index_membership': row[6] or ''
+            })
+        
+        if stocks:
+            self.logger.info(f"Loaded {len(stocks)} stocks from database")
+            return stocks
+        
+        # If not in database, fetch and save
+        self.logger.info(f"No stocks in database, fetching {index_name}...")
+        stocks = self._fetch_stock_list_manual(index_name)
+        self.save_stock_list(stocks)
+        return stocks
+    
+    def _fetch_stock_list_manual(self, index_name: str = 'NIFTY500') -> List[Dict]:
+        """Manual stock list - comprehensive coverage"""
+        stocks = [
+            # Nifty 50
+            'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'HINDUNILVR.NS',
+            'ICICIBANK.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'ITC.NS', 'KOTAKBANK.NS',
+            'LT.NS', 'AXISBANK.NS', 'ASIANPAINT.NS', 'MARUTI.NS', 'HCLTECH.NS',
+            'BAJFINANCE.NS', 'TITAN.NS', 'WIPRO.NS', 'ULTRACEMCO.NS', 'NESTLEIND.NS',
+            'SUNPHARMA.NS', 'ADANIENT.NS', 'ONGC.NS', 'NTPC.NS', 'POWERGRID.NS',
+            'TATAMOTORS.NS', 'TATASTEEL.NS', 'BAJAJFINSV.NS', 'M&M.NS', 'HDFCLIFE.NS',
+            'TECHM.NS', 'COALINDIA.NS', 'INDUSINDBK.NS', 'ADANIPORTS.NS', 'CIPLA.NS',
+            'DIVISLAB.NS', 'JSWSTEEL.NS', 'APOLLOHOSP.NS', 'DRREDDY.NS', 'BRITANNIA.NS',
+            'EICHERMOT.NS', 'HEROMOTOCO.NS', 'HINDALCO.NS', 'GRASIM.NS', 'TATACONSUM.NS',
+            'BAJAJ-AUTO.NS', 'SBILIFE.NS', 'BPCL.NS', 'UPL.NS', 'VEDL.NS',
+            
+            # Next 50
+            'ADANIGREEN.NS', 'ADANITRANS.NS', 'AMBUJACEM.NS', 'BANDHANBNK.NS',
+            'BEL.NS', 'BOSCHLTD.NS', 'CHOLAFIN.NS', 'COLPAL.NS', 'DABUR.NS',
+            'DLF.NS', 'GODREJCP.NS', 'GAIL.NS', 'HAVELLS.NS', 'ICICIPRULI.NS',
+            'JINDALSTEL.NS', 'MARICO.NS', 'NMDC.NS', 'PIIND.NS', 'PAGEIND.NS',
+            'PETRONET.NS', 'PIDILITIND.NS', 'PFC.NS', 'RECLTD.NS',
+            'SHREECEM.NS', 'SIEMENS.NS', 'SRF.NS', 'TORNTPHARM.NS', 'TRENT.NS',
+            'TVSMOTOR.NS', 'INDIGO.NS', 'BANKBARODA.NS', 'PNB.NS',
+        ]
+        
+        stock_list = []
+        for symbol in stocks:
+            stock_list.append({
+                'symbol': symbol,
+                'company_name': '',
+                'sector': '',
+                'industry': '',
+                'series': 'EQ',
+                'isin': '',
+                'index_membership': index_name
+            })
+        
+        self.logger.info(f"Loaded {len(stock_list)} stocks from manual list")
+        return stock_list
+    
+    def save_stock_list(self, stock_list: List[Dict]):
+        """Save stock list to database"""
+        cursor = self.conn.cursor()
+        
+        for stock in stock_list:
+            cursor.execute('''
+                INSERT OR REPLACE INTO stocks 
+                (symbol, company_name, sector, industry, series, isin, 
+                 index_membership, is_active, last_update_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                stock['symbol'],
+                stock.get('company_name', ''),
+                stock.get('sector', ''),
+                stock.get('industry', ''),
+                stock.get('series', 'EQ'),
+                stock.get('isin', ''),
+                stock.get('index_membership', ''),
+                1,
+                datetime.now().strftime('%Y-%m-%d')
+            ))
+        
+        self.conn.commit()
+        self.logger.info(f"OK Saved {len(stock_list)} stocks to database")
+    
+    # ========================================================================
+    # DATA DOWNLOAD
+    # ========================================================================
+    
+    @with_retry(max_attempts=3, backoff_factor=2.0)
+    def download_stock_data(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Download stock data with validation"""
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # Rate limiting
+        self.rate_limiter.acquire()
+        
+        # Download
+        self.logger.debug(f"Downloading {symbol} from {start_date} to {end_date}")
+        
+        data = yf.download(
+            symbol,
+            start=start_date,
+            end=end_date,
+            progress=False,
+            auto_adjust=False
+        )
+        
+        if data.empty:
+            raise ValueError(f"No data returned for {symbol}")
+        
+        # Validate
+        quality_report = self.validator.validate_price_data(data, symbol)
+        
+        if not quality_report.is_usable():
+            self.logger.warning(
+                f"Poor quality for {symbol}: {quality_report.quality_level.value}"
+            )
+        
+        # Save quality report
+        self._save_quality_report(symbol, quality_report)
+        
+        return data
+    
+    def bulk_download(
+        self,
+        symbols: List[str],
+        start_date: str,
+        end_date: Optional[str] = None,
+        max_workers: int = 4,
+        show_progress: bool = True
+    ) -> Dict:
+        """Bulk download with parallel processing"""
+        start_time = time.time()
+        
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        
+        self.logger.info(
+            f"Bulk download: {len(symbols)} stocks from {start_date} to {end_date}"
+        )
+        
+        results = {'success': [], 'failed': []}
+        
+        if show_progress:
+            progress_bar = tqdm(total=len(symbols), desc="Downloading")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_symbol = {
+                executor.submit(
+                    self._download_and_save_safe, 
+                    symbol, 
+                    start_date, 
+                    end_date
+                ): symbol
+                for symbol in symbols
+            }
+            
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                
+                try:
+                    success, message = future.result()
+                    
+                    if success:
+                        results['success'].append(symbol)
+                        self.stats['successful_updates'] += 1
+                        self._clear_failed_update(symbol)
+                    else:
+                        results['failed'].append((symbol, message))
+                        self.stats['failed_updates'] += 1
+                        self._track_failed_update(symbol, message)
+                    
+                    if show_progress:
+                        progress_bar.update(1)
+                
+                except Exception as e:
+                    self.logger.error(f"Error processing {symbol}: {e}")
+                    results['failed'].append((symbol, str(e)))
+                    self.stats['failed_updates'] += 1
+        
+        if show_progress:
+            progress_bar.close()
+        
+        # Save update history
+        duration = time.time() - start_time
+        self._save_update_history(
+            len(symbols),
+            len(results['success']),
+            len(results['failed']),
+            duration,
+            results['failed']
+        )
+        
+        return {
+            'duration_seconds': round(duration, 2),
+            'symbols_attempted': len(symbols),
+            'symbols_successful': len(results['success']),
+            'symbols_failed': len(results['failed']),
+            'success_rate': f"{len(results['success'])/len(symbols)*100:.1f}%"
+        }
+    
+    def _download_and_save_safe(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str
+    ) -> Tuple[bool, str]:
+        """Safely download and save data for a single stock"""
+        try:
+            # Download
+            df = self.download_stock_data(symbol, start_date, end_date)
+            
+            if df is None or df.empty:
+                return False, "No data returned"
+            
+            # Save to database
+            self._save_price_data(symbol, df)
+            
+            # Update stock metadata
+            self._update_stock_metadata(symbol)
+            
+            return True, "Success"
+        
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.warning(f"Failed to download {symbol}: {error_msg}")
+            return False, error_msg
+    
+    def _save_price_data(self, symbol: str, df: pd.DataFrame):
+        """Save price data to database"""
+        cursor = self.conn.cursor()
+        
+        for date, row in df.iterrows():
+            cursor.execute('''
+                INSERT OR REPLACE INTO price_data
+                (symbol, date, open, high, low, close, adj_close, volume, 
+                 validated, data_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                symbol,
+                date.strftime('%Y-%m-%d'),
+                float(row['Open'].iloc[0]),
+                float(row['High'].iloc[0]),
+                float(row['Low'].iloc[0]),
+                float(row['Close'].iloc[0]),
+                float(row['Adj Close'].iloc[0]),
+                int(row['Volume'].iloc[0]),
+                1,
+                'yfinance'
+            ))
+        
+        self.conn.commit()
+    
+    def _update_stock_metadata(self, symbol: str):
+        """Update stock metadata after successful download"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            UPDATE stocks
+            SET last_update_date = ?,
+                last_modified = ?
+            WHERE symbol = ?
+        ''', (
+            datetime.now().strftime('%Y-%m-%d'),
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            symbol
+        ))
+        
+        self.conn.commit()
+    
+    # ========================================================================
+    # QUALITY TRACKING
+    # ========================================================================
+    
+    def _save_quality_report(self, symbol: str, report):
+        """Save quality report to history"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO data_quality_history
+            (symbol, check_date, quality_level, quality_score, 
+             total_records, missing_records, duplicate_records, 
+             outliers, date_gaps, first_date, last_date, issues)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            symbol,
+            datetime.now().strftime('%Y-%m-%d'),
+            report.quality_level.value,
+            report.score,
+            report.total_records,
+            report.missing_records,
+            report.duplicate_records,
+            report.outliers,
+            report.date_gaps,
+            report.first_date,
+            report.last_date,
+            '|'.join(report.issues)
+        ))
+        
+        # Also update latest quality score in stocks table
+        cursor.execute('''
+            UPDATE stocks
+            SET data_quality_score = ?
+            WHERE symbol = ?
+        ''', (report.score, symbol))
+        
+        self.conn.commit()
+    
+    # ========================================================================
+    # FAILED UPDATE MANAGEMENT
+    # ========================================================================
+    
+    def _track_failed_update(self, symbol: str, error: str):
+        """Track failed update for retry"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, failure_count FROM failed_updates
+            WHERE symbol = ? AND status = 'pending'
+        ''', [symbol])
+        
+        existing = cursor.fetchone()
+        
+        if existing:
+            cursor.execute('''
+                UPDATE failed_updates
+                SET failure_count = failure_count + 1,
+                    failure_date = ?,
+                    last_error = ?,
+                    last_modified = ?
+                WHERE id = ?
+            ''', (
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                error,
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                existing[0]
+            ))
+        else:
+            cursor.execute('''
+                INSERT INTO failed_updates
+                (symbol, failure_date, failure_count, last_error, status)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                symbol,
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                1,
+                error,
+                'pending'
+            ))
+        
+        self.conn.commit()
+    
+    def _clear_failed_update(self, symbol: str):
+        """Clear symbol from failed updates"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE failed_updates
+            SET status = 'resolved',
+                last_modified = ?
+            WHERE symbol = ? AND status = 'pending'
+        ''', [datetime.now().strftime('%Y-%m-%d %H:%M:%S'), symbol])
+        self.conn.commit()
+    
+    def retry_failed_updates(self) -> Dict:
+        """Retry all failed updates"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            SELECT DISTINCT symbol FROM failed_updates
+            WHERE status = 'pending'
+        ''')
+        
+        failed_symbols = [row[0] for row in cursor.fetchall()]
+        
+        if not failed_symbols:
+            self.logger.info("No failed updates to retry")
+            return {'retried': 0, 'success': 0, 'still_failed': 0}
+        
+        self.logger.info(f"Retrying {len(failed_symbols)} failed updates")
+        
+        # Calculate start date (last 30 days)
+        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        
+        stats = self.bulk_download(
+            failed_symbols,
+            start_date=start_date,
+            show_progress=True
+        )
+        
+        return {
+            'retried': len(failed_symbols),
+            'success': stats['symbols_successful'],
+            'still_failed': stats['symbols_failed']
+        }
+    
+    # ========================================================================
+    # UPDATE HISTORY
+    # ========================================================================
+    
+    def _save_update_history(
+        self,
+        attempted: int,
+        successful: int,
+        failed: int,
+        duration: float,
+        errors: List
+    ):
+        """Save update history"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO update_history
+            (update_date, update_type, symbols_attempted, 
+             symbols_successful, symbols_failed, duration_seconds, errors)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'bulk',
+            attempted,
+            successful,
+            failed,
+            duration,
+            str(errors[:10])  # First 10 errors
+        ))
+        
+        self.conn.commit()
+    
+    # ========================================================================
+    # REPORTING
+    # ========================================================================
+    
+    def get_system_health(self) -> Dict:
+        """Get comprehensive system health report"""
+        cursor = self.conn.cursor()
+        
+        # Total stocks
+        cursor.execute('SELECT COUNT(*) FROM stocks WHERE is_active = 1')
+        total_stocks = cursor.fetchone()[0]
+        
+        # Average quality score
+        cursor.execute('SELECT AVG(data_quality_score) FROM stocks WHERE is_active = 1')
+        avg_quality = cursor.fetchone()[0] or 0
+        
+        # Failed updates
+        cursor.execute("SELECT COUNT(*) FROM failed_updates WHERE status = 'pending'")
+        failed_count = cursor.fetchone()[0]
+        
+        # Last update
+        cursor.execute('SELECT MAX(update_date) FROM update_history')
+        last_update = cursor.fetchone()[0]
+        
+        # Total records
+        cursor.execute('SELECT COUNT(*) FROM price_data')
+        total_records = cursor.fetchone()[0]
+        
+        return {
+            'total_stocks': total_stocks,
+            'total_records': total_records,
+            'avg_data_quality': round(avg_quality, 2),
+            'failed_updates': failed_count,
+            'last_update': last_update,
+            'update_stats': self.stats
+        }
+    
+    def get_data_quality_report(self) -> pd.DataFrame:
+        """Get comprehensive data quality report"""
+        query = '''
+            SELECT 
+                s.symbol,
+                s.company_name,
+                s.data_quality_score,
+                s.last_update_date,
+                dqh.quality_level,
+                dqh.total_records,
+                dqh.issues
+            FROM stocks s
+            LEFT JOIN (
+                SELECT symbol, quality_level, total_records, issues,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY check_date DESC) as rn
+                FROM data_quality_history
+            ) dqh ON s.symbol = dqh.symbol AND dqh.rn = 1
+            WHERE s.is_active = 1
+            ORDER BY s.data_quality_score DESC
+        '''
+        
+        return pd.read_sql_query(query, self.conn)
+    
+    def download_historical_data(
+        self,
+        symbols: List[str],
+        start_date: str,
+        end_date: Optional[str] = None,
+        batch_size: int = 10,
+        delay: float = 1.0
+    ):
+        """
+        Download historical data with rate limiting
+        
+        Args:
+            symbols: List of stock symbols
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (default: today)
+            batch_size: Number of stocks before delay
+            delay: Seconds to wait between batches
+        """
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        
+        print(f"\n{'='*70}")
+        print(f"DOWNLOADING HISTORICAL DATA")
+        print(f"Period: {start_date} to {end_date}")
+        print(f"Stocks: {len(symbols)}")
+        print(f"{'='*70}\n")
+        
+        success_count = 0
+        fail_count = 0
+        
+        for i, symbol in enumerate(symbols, 1):
+            try:
+                print(f"[{i}/{len(symbols)}] {symbol}...", end=' ', flush=True)
+                
+                # Download with rate limiting
+                self.rate_limiter.acquire()
+                
+                data = yf.download(
+                    symbol,
+                    start=start_date,
+                    end=end_date,
+                    progress=False,
+                    auto_adjust=False
+                )
+                
+                if data.empty:
+                    print("X No data")
+                    fail_count += 1
+                    continue
+                
+                # Save to database
+                self._save_price_data(symbol, data)
+                
+                # Update quality
+                quality_report = self.validator.validate_price_data(data, symbol)
+                self._save_quality_report(symbol, quality_report)
+                
+                # Update stock metadata
+                self._update_stock_metadata(symbol)
+                
+                print(f"OK {len(data)} records")
+                success_count += 1
+                
+                # Rate limiting - additional delay every batch_size downloads
+                if i % batch_size == 0:
+                    print(f"\n⏸  Pausing {delay}s to avoid rate limits...")
+                    time.sleep(delay)
+                
+            except Exception as e:
+                print(f"X Error: {str(e)[:50]}")
+                fail_count += 1
+                self._track_failed_update(symbol, str(e))
+                continue
+        
+        print(f"\n{'='*70}")
+        print(f"DOWNLOAD COMPLETE")
+        print(f"Success: {success_count} | Failed: {fail_count}")
+        print(f"{'='*70}\n")
+        
+        # Save update history
+        self._save_update_history(
+            len(symbols),
+            success_count,
+            fail_count,
+            0,  # duration not tracked here
+            []
+        )
+    
+    def close(self):
+        """Close database connection"""
+        self.conn.close()
+        self.logger.info("Unified Data Manager closed")
+
+
+def main():
+    # Initialize
+    manager = UnifiedDataManager()
+    
+    print("="*80)
+    print("UNIFIED DATA MANAGER")
+    print("="*80)
+    
+    # Get stock list
+    stocks = manager.get_stock_list('NIFTY500')
+    print(f"\nLoaded {len(stocks)} stocks")
+    
+    # Download data (first 10 for demo)
+    symbols = [s['symbol'] for s in stocks[:10]]
+    stats = manager.bulk_download(
+        symbols,
+        start_date='2020-01-01',
+        max_workers=4
+    )
+    
+    print(f"\nDownload Stats:")
+    for key, value in stats.items():
+        print(f"  {key}: {value}")
+    
+    # System health
+    health = manager.get_system_health()
+    print(f"\nSystem Health:")
+    for key, value in health.items():
+        print(f"  {key}: {value}")
+    
+    manager.close()
+
+# Usage example
+if __name__ == "__main__":
+    main()

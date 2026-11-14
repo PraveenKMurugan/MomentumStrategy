@@ -1,0 +1,37 @@
+
+# ============================================================================
+# FILE: config/production.yaml
+# Production environment overrides
+# ============================================================================
+
+database:
+  path: "/var/lib/momentum/production.db"
+  backup_enabled: true
+  backup_frequency: "hourly"
+
+api:
+  rate_limit: 50  # Conservative in production
+  timeout: 30
+  retry_attempts: 5
+
+logging:
+  level: "WARNING"
+  json_format: true
+  retention_days: 90
+
+alerts:
+  email_enabled: true
+  email_from: "momentum-system@yourdomain.com"
+  email_to:
+    - "admin@yourdomain.com"
+    - "trading-team@yourdomain.com"
+  slack_enabled: true
+
+security:
+  require_authentication: true
+  session_timeout: 1800
+
+performance:
+  cache_size_mb: 5000
+  max_workers: 8
+

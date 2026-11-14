@@ -1,0 +1,23 @@
+# ============================================================================
+# FILE: config/development.yaml
+# Development environment overrides
+# ============================================================================
+
+database:
+  path: "dev_stocks.db"
+  backup_enabled: false
+
+api:
+  rate_limit: 200  # More lenient in development
+  timeout: 60
+
+logging:
+  level: "DEBUG"
+  json_format: false
+
+alerts:
+  email_enabled: false
+  slack_enabled: false
+
+performance:
+  parallel_downloads: false  # Easier debugging

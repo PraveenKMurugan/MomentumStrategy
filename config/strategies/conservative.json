@@ -1,0 +1,33 @@
+{
+  "config_name": "Conservative",
+  "universe": "NIFTY50",
+  "custom_symbols": null,
+  "performance_periods": {
+    "12M": {
+      "days": 252,
+      "weight": 0.6
+    },
+    "6M": {
+      "days": 126,
+      "weight": 0.4
+    }
+  },
+  "volatility_periods": {
+    "6M_vol": 126
+  },
+  "momentum_weights": {
+    "12M": 0.6,
+    "6M": 0.4
+  },
+  "filters": {
+    "volume": {
+      "min_value": 500000
+    },
+    "volatility": {
+      "max_value": 40
+    },
+    "momentum": {
+      "min_value": 5
+    }
+  }
+}

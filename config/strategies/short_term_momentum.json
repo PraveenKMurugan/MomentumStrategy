@@ -1,0 +1,30 @@
+{
+  "config_name": "Short_Term_Momentum",
+  "universe": "NIFTY500",
+  "custom_symbols": null,
+  "performance_periods": {
+    "6M": {
+      "days": 126,
+      "weight": 0.6
+    },
+    "3M": {
+      "days": 63,
+      "weight": 0.4
+    }
+  },
+  "volatility_periods": {
+    "3M_vol": 63
+  },
+  "momentum_weights": {
+    "6M": 0.6,
+    "3M": 0.4
+  },
+  "filters": {
+    "volume": {
+      "min_value": 100000
+    },
+    "volatility": {
+      "max_value": 50
+    }
+  }
+}

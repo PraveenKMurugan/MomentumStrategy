@@ -1,0 +1,111 @@
+# ============================================================================
+# FILE: config/base.yaml
+# Base configuration shared across all environments
+# ============================================================================
+
+# Database Configuration
+database:
+  path: "indian_stocks.db"
+  backup_enabled: true
+  backup_frequency: "daily"
+  backup_retention_days: 30
+  connection_timeout: 30
+  pool_size: 10
+
+# API Configuration
+api:
+  rate_limit: 100  # requests per minute
+  timeout: 30  # seconds
+  retry_attempts: 3
+  retry_backoff: 2.0  # exponential backoff multiplier
+  batch_size: 10  # stocks to fetch in parallel
+
+# Trading Configuration
+trading:
+  transaction_cost_pct: 0.0005  # 0.05% (brokerage + STT)
+  slippage_pct: 0.0005  # 0.05%
+  min_position_size: 0.03  # 3% of portfolio
+  max_position_size: 0.15  # 15% of portfolio
+  min_portfolio_stocks: 7
+  max_portfolio_stocks: 20
+
+# Risk Management
+risk:
+  max_drawdown_threshold: -0.15  # -15%
+  volatility_spike_threshold: 0.50  # 50%
+  position_concentration_limit: 0.25  # 25% in single sector
+  max_leverage: 1.0  # No leverage
+  stop_loss_pct: -0.20  # -40% portfolio stop loss
+
+# Data Management
+data:
+  min_history_days: 252  # 1 year minimum
+  update_frequency: "daily"
+  update_time: "15:30"  # After market close
+  quality_check_enabled: true
+  cache_enabled: true
+  cache_ttl: 3600  # 1 hour
+
+# Filters
+filters:
+  volume:
+    min_value: 100000  # 1 lakh shares/day
+  volatility:
+    max_value: 55  # 55% annualized
+  momentum:
+    min_value: 8  # 8% minimum momentum score
+
+# Momentum Calculation
+momentum:
+  periods:
+    - name: "12M"
+      days: 252
+      weight: 0.5
+    - name: "6M"
+      days: 126
+      weight: 0.3
+    - name: "3M"
+      days: 63
+      weight: 0.2
+  exclude_recent_period: 21  # Exclude last 1 month
+
+# Rebalancing
+rebalancing:
+  frequency: "6M"  # Every 6 months
+  min_interval_days: 126
+  weight_drift_threshold: 0.05  # 5%
+  momentum_percentile_threshold: 40  # Bottom 40% triggers sell
+
+# Logging
+logging:
+  level: "INFO"
+  directory: "logs"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+  daily_rotation: true
+  retention_days: 30
+  json_format: false
+
+# Alerts
+alerts:
+  email_enabled: false
+  email_from: null
+  email_to: []
+  email_smtp_server: "smtp.gmail.com"
+  email_smtp_port: 587
+  slack_enabled: false
+  slack_webhook: null
+  sms_enabled: false
+
+# Performance
+performance:
+  enable_caching: true
+  cache_size_mb: 1000
+  parallel_downloads: true
+  max_workers: 4
+
+# Security
+security:
+  encrypt_database: false
+  require_authentication: false
+  session_timeout: 3600

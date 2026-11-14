@@ -1,0 +1,618 @@
+"""
+Enterprise Dynamic Stock Analyzer
+src/analysis/dynamic_analyzer.py
+
+Integrates Module 2 (Stock Analysis) with Enterprise Features
+"""
+
+import pandas as pd
+import numpy as np
+import sqlite3
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+import json
+
+# Import enterprise components
+from src.core.config import ConfigManager
+from src.core.logging import LoggerFactory
+from src.core.errors import ErrorHandler, with_retry, RecoveryAction
+from src.core.validation import DataValidator
+
+
+class StrategyConfig:
+    """
+    Configuration class for dynamic strategy customization
+    """
+    
+    def __init__(self, config_name="default"):
+        """Initialize strategy configuration"""
+        self.config_name = config_name
+        self.universe = "NIFTY500"
+        self.performance_periods = {}
+        self.volatility_periods = {}
+        self.filters = {}
+        self.momentum_weights = {}
+        
+    def set_universe(self, universe_type: str, custom_symbols: List[str] = None):
+        """
+        Set stock universe
+        
+        Args:
+            universe_type: 'NIFTY50', 'NIFTY500', 'NIFTY_MIDCAP', 'ALL', 'CUSTOM'
+            custom_symbols: List of symbols if universe_type='CUSTOM'
+        """
+        self.universe = universe_type
+        self.custom_symbols = custom_symbols
+        return self
+    
+    def add_performance_period(self, name: str, days: int, weight: float = 1.0):
+        """
+        Add a performance period for momentum calculation
+        
+        Args:
+            name: Identifier (e.g., '3M', '6M', '12M')
+            days: Number of trading days
+            weight: Weight in final momentum score
+        """
+        self.performance_periods[name] = {
+            'days': days,
+            'weight': weight
+        }
+        return self
+    
+    def add_volatility_period(self, name: str, days: int):
+        """Add a volatility measurement period"""
+        self.volatility_periods[name] = days
+        return self
+    
+    def set_momentum_weights(self, weights_dict: Dict[str, float]):
+        """
+        Set custom weights for momentum scoring
+        
+        Example:
+            config.set_momentum_weights({'6M': 0.5, '3M': 0.3, '1M': 0.2})
+        """
+        self.momentum_weights = weights_dict
+        return self
+    
+    def add_filter(self, filter_name: str, **kwargs):
+        """
+        Add filter criteria
+        
+        Examples:
+            config.add_filter('volume', min_value=100000)
+            config.add_filter('volatility', max_value=60)
+            config.add_filter('momentum', min_value=10)
+        """
+        self.filters[filter_name] = kwargs
+        return self
+    
+    def to_dict(self) -> Dict:
+        """Convert configuration to dictionary"""
+        return {
+            'config_name': self.config_name,
+            'universe': self.universe,
+            'custom_symbols': getattr(self, 'custom_symbols', None),
+            'performance_periods': self.performance_periods,
+            'volatility_periods': self.volatility_periods,
+            'momentum_weights': self.momentum_weights,
+            'filters': self.filters
+        }
+    
+    def save(self, filename: str = None) -> str:
+        """Save configuration to JSON file"""
+        if filename is None:
+            filename = f"config/strategies/{self.config_name}.json"
+        
+        import os
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        
+        with open(filename, 'w', encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2)
+        
+        return filename
+    
+    @classmethod
+    def load(cls, filename: str):
+        """Load configuration from JSON file"""
+        with open(filename, 'r', encoding="utf-8") as f:
+            data = json.load(f)
+        
+        config = cls(data['config_name'])
+        config.universe = data['universe']
+        config.custom_symbols = data.get('custom_symbols')
+        config.performance_periods = data['performance_periods']
+        config.volatility_periods = data['volatility_periods']
+        config.momentum_weights = data['momentum_weights']
+        config.filters = data['filters']
+        
+        return config
+    
+    def display(self):
+        """Display configuration"""
+        print(f"\n{'='*80}")
+        print(f"STRATEGY CONFIGURATION: {self.config_name}")
+        print(f"{'='*80}")
+        print(f"\nUniverse: {self.universe}")
+        
+        if self.performance_periods:
+            print(f"\nPerformance Periods:")
+            for name, config in self.performance_periods.items():
+                print(f"  {name}: {config['days']} days (weight: {config['weight']})")
+        
+        if self.volatility_periods:
+            print(f"\nVolatility Periods:")
+            for name, days in self.volatility_periods.items():
+                print(f"  {name}: {days} days")
+        
+        if self.momentum_weights:
+            print(f"\nMomentum Weights:")
+            for name, weight in self.momentum_weights.items():
+                print(f"  {name}: {weight}")
+        
+        if self.filters:
+            print(f"\nFilters:")
+            for name, criteria in self.filters.items():
+                print(f"  {name}: {criteria}")
+        
+        print(f"{'='*80}\n")
+
+
+class DynamicStockAnalyzer:
+    """
+    Enterprise Dynamic Stock Analyzer
+    
+    Features:
+    - Customizable momentum calculations
+    - Multiple filter criteria
+    - Performance tracking
+    - Error handling
+    - Caching
+    - Logging
+    """
+    
+    def __init__(self, db_path: str = None):
+        """Initialize analyzer with enterprise features"""
+        # Load configuration
+        self.sys_config = ConfigManager()
+        
+        # Setup logging
+        self.logger = LoggerFactory.create_logger(
+            'stock_analyzer',
+            self.sys_config,
+            context={'component': 'analysis'}
+        )
+        
+        self.logger.info("Initializing Enterprise Stock Analyzer...")
+        
+        # Initialize components
+        self.error_handler = ErrorHandler(self.logger, self.sys_config)
+        self.validator = DataValidator(self.logger, self.sys_config)
+        
+        # Database
+        if db_path is None:
+            db_path = self.sys_config.get('database.path')
+        
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        # Enable foreign keys
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        
+        # Strategy configuration
+        self.strategy_config = None
+        
+        self.logger.info("OK Stock Analyzer initialized successfully")
+    
+    def set_config(self, config: StrategyConfig):
+        """Set the strategy configuration"""
+        self.strategy_config = config
+        self.logger.info(f"Strategy configuration set: {config.config_name}")
+        return self
+    
+    def get_universe_symbols(self) -> List[str]:
+        """Get symbols based on configured universe"""
+        if self.strategy_config is None:
+            raise ValueError("Strategy configuration not set. Use set_config() first.")
+        
+        cursor = self.conn.cursor()
+        
+        try:
+            if self.strategy_config.universe == 'ALL':
+                cursor.execute('SELECT symbol FROM stocks WHERE is_active = 1 ORDER BY symbol')
+                symbols = [row[0] for row in cursor.fetchall()]
+            
+            elif self.strategy_config.universe == 'CUSTOM':
+                if not self.strategy_config.custom_symbols:
+                    raise ValueError("Custom symbols not provided")
+                symbols = self.strategy_config.custom_symbols
+            
+            else:
+                # Get from index membership
+                cursor.execute(
+                    'SELECT symbol FROM stocks WHERE index_membership LIKE ? AND is_active = 1',
+                    [f'%{self.strategy_config.universe}%']
+                )
+                symbols = [row[0] for row in cursor.fetchall()]
+                
+                # Fallback to all if none found
+                if not symbols:
+                    self.logger.warning(
+                        f"No stocks found for {self.strategy_config.universe}, using all stocks"
+                    )
+                    cursor.execute('SELECT symbol FROM stocks WHERE is_active = 1 LIMIT 500')
+                    symbols = [row[0] for row in cursor.fetchall()]
+            
+            self.logger.info(f"Universe '{self.strategy_config.universe}': {len(symbols)} stocks")
+            return symbols
+            
+        except Exception as e:
+            self.error_handler.handle(
+                e,
+                context={'function': 'get_universe_symbols', 'universe': self.strategy_config.universe}
+            )
+            raise
+    
+    @with_retry(max_attempts=3, backoff_factor=1.5)
+    def get_stock_data(self, symbol: str, start_date: str, end_date: str = None) -> pd.DataFrame:
+        """Retrieve stock data from database"""
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        
+        query = '''
+            SELECT date, adj_close, volume
+            FROM price_data
+            WHERE symbol = ? AND date >= ? AND date <= ? AND validated = 1
+            ORDER BY date
+        '''
+        
+        df = pd.read_sql_query(query, self.conn, params=[symbol, start_date, end_date])
+        
+        if not df.empty:
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+            df.columns = ['price', 'volume']
+        
+        return df
+    
+    def calculate_metrics(self, symbol: str, as_of_date: str = None) -> Optional[Dict]:
+        """
+        Calculate all configured metrics for a stock
+        
+        Args:
+            symbol: Stock symbol
+            as_of_date: Calculate metrics as of this date
+        
+        Returns:
+            Dictionary with all calculated metrics
+        """
+        if self.strategy_config is None:
+            raise ValueError("Strategy configuration not set")
+        
+        if as_of_date is None:
+            as_of_date = datetime.now().strftime('%Y-%m-%d')
+        
+        try:
+            # Calculate required lookback
+            max_days = 252
+            if self.strategy_config.performance_periods:
+                max_days = max(max_days, max(p['days'] for p in self.strategy_config.performance_periods.values()))
+            if self.strategy_config.volatility_periods:
+                max_days = max(max_days, max(self.strategy_config.volatility_periods.values()))
+            
+            # Get data
+            start_date = (datetime.strptime(as_of_date, '%Y-%m-%d') - timedelta(days=int(max_days * 1.5))).strftime('%Y-%m-%d')
+            df = self.get_stock_data(symbol, start_date, as_of_date)
+            
+            if df.empty or len(df) < max_days:
+                self.logger.debug(f"Insufficient data for {symbol}: {len(df)} records")
+                return None
+            
+            metrics = {'symbol': symbol}
+            
+            # Calculate performance metrics
+            for name, config in self.strategy_config.performance_periods.items():
+                days = config['days']
+                if len(df) >= days:
+                    ret = (df['price'].iloc[-1] / df['price'].iloc[-days] - 1) * 100
+                    metrics[f'{name}_return'] = round(ret, 2)
+                    metrics[f'{name}_weight'] = config['weight']
+            
+            # Calculate volatility metrics
+            for name, days in self.strategy_config.volatility_periods.items():
+                if len(df) >= days:
+                    returns = df['price'].pct_change().dropna()
+                    vol = returns.tail(days).std() * np.sqrt(252) * 100
+                    metrics[f'{name}_volatility'] = round(vol, 2)
+            
+            # Calculate composite momentum score
+            if self.strategy_config.momentum_weights:
+                momentum_score = 0
+                total_weight = 0
+                
+                for period_name, weight in self.strategy_config.momentum_weights.items():
+                    return_key = f'{period_name}_return'
+                    if return_key in metrics:
+                        momentum_score += metrics[return_key] * weight
+                        total_weight += weight
+                
+                if total_weight > 0:
+                    metrics['momentum_score'] = round(momentum_score, 2)
+            
+            # Liquidity metrics
+            if len(df) >= 63:
+                metrics['avg_volume'] = int(df['volume'].tail(63).mean())
+                metrics['avg_turnover'] = round((df['volume'] * df['price']).tail(63).mean(), 2)
+            
+            # Current price
+            metrics['current_price'] = round(df['price'].iloc[-1], 2)
+            metrics['calculation_date'] = as_of_date
+            
+            return metrics
+            
+        except Exception as e:
+            recovery = self.error_handler.handle(
+                e,
+                context={'symbol': symbol, 'function': 'calculate_metrics'}
+            )
+            
+            if recovery == RecoveryAction.SKIP:
+                return None
+            else:
+                raise
+    
+    def analyze_universe(self, as_of_date: str = None, show_progress: bool = True) -> pd.DataFrame:
+        """
+        Analyze entire configured universe
+        
+        Returns:
+            DataFrame with all metrics for all stocks
+        """
+        if self.strategy_config is None:
+            raise ValueError("Strategy configuration not set")
+        
+        symbols = self.get_universe_symbols()
+        
+        self.logger.info(f"Analyzing {len(symbols)} stocks with strategy: {self.strategy_config.config_name}")
+        
+        results = []
+        stats = {'success': 0, 'failed': 0, 'skipped': 0}
+        
+        # Progress tracking
+        if show_progress:
+            from tqdm import tqdm
+            symbols_iter = tqdm(symbols, desc="Analyzing stocks")
+        else:
+            symbols_iter = symbols
+        
+        for symbol in symbols_iter:
+            try:
+                metrics = self.calculate_metrics(symbol, as_of_date)
+                
+                if metrics:
+                    results.append(metrics)
+                    stats['success'] += 1
+                else:
+                    stats['skipped'] += 1
+                    
+            except Exception as e:
+                self.logger.error(f"Failed to analyze {symbol}: {e}")
+                stats['failed'] += 1
+        
+        self.logger.info(
+            f"Analysis complete: {stats['success']} success, "
+            f"{stats['skipped']} skipped, {stats['failed']} failed"
+        )
+        
+        # Create DataFrame
+        df = pd.DataFrame(results)
+        
+        # Sort by momentum score if available
+        if not df.empty and 'momentum_score' in df.columns:
+            df = df.sort_values('momentum_score', ascending=False)
+        
+        return df.reset_index(drop=True)
+    
+    def apply_filters(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply configured filters to analysis results"""
+        if self.strategy_config is None:
+            raise ValueError("Strategy configuration not set")
+        if len(df) == 0:
+            self.logger.warning("No stocks to filter - input DataFrame is empty")
+            return df
+
+        filtered = df.copy()
+        initial_count = len(filtered)
+        
+        self.logger.info(f"Applying filters to {initial_count} stocks")
+        
+        for filter_name, criteria in self.strategy_config.filters.items():
+            # Volume filter
+            if filter_name == 'volume':
+                if 'min_value' in criteria and 'avg_volume' in filtered.columns:
+                    filtered = filtered[filtered['avg_volume'] >= criteria['min_value']]
+                    self.logger.info(f"Volume filter: {len(filtered)} stocks remain")
+            
+            # Volatility filter
+            elif filter_name == 'volatility':
+                vol_cols = [col for col in filtered.columns if 'volatility' in col]
+                if vol_cols and 'max_value' in criteria:
+                    filtered = filtered[filtered[vol_cols[0]] <= criteria['max_value']]
+                    self.logger.info(f"Volatility filter: {len(filtered)} stocks remain")
+            
+            # Momentum filter
+            elif filter_name == 'momentum':
+                if 'min_value' in criteria and 'momentum_score' in filtered.columns:
+                    filtered = filtered[filtered['momentum_score'] >= criteria['min_value']]
+                    self.logger.info(f"Momentum filter: {len(filtered)} stocks remain")
+            
+            # Market cap filter
+            elif filter_name == 'market_cap':
+                if 'min_value' in criteria and 'market_cap_cr' in filtered.columns:
+                    filtered = filtered[filtered['market_cap_cr'] >= criteria['min_value']]
+                    self.logger.info(f"Market cap filter: {len(filtered)} stocks remain")
+        
+        percentage = (len(filtered) / initial_count * 100) if initial_count > 0 else 0
+        self.logger.info(
+            f"Filtering complete: {initial_count} -> {len(filtered)} ({percentage:.1f}%)"
+        )
+        
+        return filtered.reset_index(drop=True)
+    
+    def select_top_stocks(self, df: pd.DataFrame, n: int = 20, method: str = 'momentum') -> pd.DataFrame:
+        """
+        Select top N stocks based on various methods
+        
+        Args:
+            df: Filtered stocks DataFrame
+            n: Number of stocks to select
+            method: 'momentum', 'sharpe', 'balanced'
+        """
+        if method == 'momentum' and 'momentum_score' in df.columns:
+            return df.nlargest(n, 'momentum_score')
+        
+        elif method == 'balanced' and all(col in df.columns for col in ['momentum_score', 'volatility']):
+            df_copy = df.copy()
+            # Find volatility column
+            vol_col = [col for col in df.columns if 'volatility' in col][0]
+            df_copy['balanced_score'] = df_copy['momentum_score'] / df_copy[vol_col]
+            return df_copy.nlargest(n, 'balanced_score')
+        
+        return df.head(n)
+    
+    def save_analysis(self, df: pd.DataFrame, filename: str = None):
+        """Save analysis results to database and CSV"""
+        if filename is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"results/analysis_{self.strategy_config.config_name}_{timestamp}.csv"
+        
+        import os
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        
+        # Save to CSV
+        df.to_csv(filename, index=False)
+        self.logger.info(f"Analysis saved to {filename}")
+        
+        # Save to database
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analysis_results (
+                analysis_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_name TEXT,
+                analysis_date TEXT,
+                symbol TEXT,
+                momentum_score REAL,
+                selected INTEGER DEFAULT 0
+            )
+        ''')
+        
+        for _, row in df.iterrows():
+            cursor.execute('''
+                INSERT INTO analysis_results 
+                (strategy_name, analysis_date, symbol, momentum_score)
+                VALUES (?, ?, ?, ?)
+            ''', (
+                self.strategy_config.config_name,
+                datetime.now().strftime('%Y-%m-%d'),
+                row['symbol'],
+                row.get('momentum_score')
+            ))
+        
+        self.conn.commit()
+        self.logger.info(f"Analysis saved to database: {len(df)} records")
+    
+    def close(self):
+        """Close database connection"""
+        self.conn.close()
+        self.logger.info("Stock Analyzer closed")
+
+
+# Pre-defined strategy configurations
+class PresetStrategies:
+    """Common strategy presets"""
+    
+    @staticmethod
+    def classic_momentum():
+        """Classic momentum: 12M-1M return"""
+        config = StrategyConfig("Classic_Momentum")
+        config.set_universe("NIFTY500")
+        config.add_performance_period('12M', 252, weight=1.0)
+        config.add_performance_period('1M', 21, weight=-1.0)
+        config.add_volatility_period('6M_vol', 126)
+        config.set_momentum_weights({'12M': 1.0, '1M': -1.0})
+        config.add_filter('volume', min_value=100000)
+        config.add_filter('volatility', max_value=60)
+        return config
+    
+    @staticmethod
+    def short_term_momentum():
+        """Short-term: 6M + 3M momentum"""
+        config = StrategyConfig("Short_Term_Momentum")
+        config.set_universe("NIFTY500")
+        config.add_performance_period('6M', 126, weight=0.6)
+        config.add_performance_period('3M', 63, weight=0.4)
+        config.add_volatility_period('3M_vol', 63)
+        config.set_momentum_weights({'6M': 0.6, '3M': 0.4})
+        config.add_filter('volume', min_value=100000)
+        config.add_filter('volatility', max_value=50)
+        return config
+    
+    @staticmethod
+    def balanced_momentum():
+        """Balanced: 12M, 6M, 3M weighted"""
+        config = StrategyConfig("Balanced_Momentum")
+        config.set_universe("NIFTY500")
+        config.add_performance_period('12M', 252, weight=0.5)
+        config.add_performance_period('6M', 126, weight=0.3)
+        config.add_performance_period('3M', 63, weight=0.2)
+        config.add_volatility_period('6M_vol', 126)
+        config.set_momentum_weights({'12M': 0.5, '6M': 0.3, '3M': 0.2})
+        config.add_filter('volume', min_value=100000)
+        config.add_filter('volatility', max_value=60)
+        config.add_filter('momentum', min_value=10)
+        return config
+
+    @staticmethod
+    def six_month_momentum():
+        """6-Month Momentum Focus"""
+        config = StrategyConfig("Six_Month_Momentum")
+        config.set_universe("NIFTY500")
+        config.add_performance_period('6M', 126, weight=1.0)
+        config.add_volatility_period('3M_vol', 63)
+        config.set_momentum_weights({'6M': 1.0})
+        config.add_filter('volume', min_value=150000)
+        config.add_filter('volatility', max_value=55)
+        return config
+
+# Usage example
+if __name__ == "__main__":
+    # Initialize analyzer
+    analyzer = DynamicStockAnalyzer()
+    
+    # Use preset strategy
+    config = PresetStrategies.balanced_momentum()
+    config.display()
+    
+    # Or create custom strategy
+    custom_config = StrategyConfig("My_Custom_Strategy")
+    custom_config.set_universe("NIFTY500")
+    custom_config.add_performance_period('6M', 126, weight=0.6)
+    custom_config.add_performance_period('3M', 63, weight=0.4)
+    custom_config.add_volatility_period('3M_vol', 63)
+    custom_config.set_momentum_weights({'6M': 0.6, '3M': 0.4})
+    custom_config.add_filter('volume', min_value=100000)
+    custom_config.add_filter('volatility', max_value=55)
+    custom_config.add_filter('momentum', min_value=8)
+    
+    # Set and run
+    analyzer.set_config(custom_config)
+    results = analyzer.analyze_universe()
+    filtered = analyzer.apply_filters(results)
+    top_stocks = analyzer.select_top_stocks(filtered, n=20)
+    
+    print("\nTop 20 Stocks:")
+    print(top_stocks[['symbol', 'momentum_score', 'current_price']].to_string())
+    
+    # Save results
+    analyzer.save_analysis(top_stocks)
+    
+    analyzer.close()

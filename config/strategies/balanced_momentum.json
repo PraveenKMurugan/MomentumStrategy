@@ -1,0 +1,38 @@
+{
+  "config_name": "Balanced_Momentum",
+  "universe": "NIFTY500",
+  "custom_symbols": null,
+  "performance_periods": {
+    "12M": {
+      "days": 252,
+      "weight": 0.5
+    },
+    "6M": {
+      "days": 126,
+      "weight": 0.3
+    },
+    "3M": {
+      "days": 63,
+      "weight": 0.2
+    }
+  },
+  "volatility_periods": {
+    "6M_vol": 126
+  },
+  "momentum_weights": {
+    "12M": 0.5,
+    "6M": 0.3,
+    "3M": 0.2
+  },
+  "filters": {
+    "volume": {
+      "min_value": 100000
+    },
+    "volatility": {
+      "max_value": 60
+    },
+    "momentum": {
+      "min_value": 10
+    }
+  }
+}

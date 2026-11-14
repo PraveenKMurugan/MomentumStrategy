@@ -1,0 +1,30 @@
+{
+  "config_name": "Classic_Momentum",
+  "universe": "NIFTY500",
+  "custom_symbols": null,
+  "performance_periods": {
+    "12M": {
+      "days": 252,
+      "weight": 1.0
+    },
+    "1M": {
+      "days": 21,
+      "weight": -1.0
+    }
+  },
+  "volatility_periods": {
+    "6M_vol": 126
+  },
+  "momentum_weights": {
+    "12M": 1.0,
+    "1M": -1.0
+  },
+  "filters": {
+    "volume": {
+      "min_value": 100000
+    },
+    "volatility": {
+      "max_value": 60
+    }
+  }
+}

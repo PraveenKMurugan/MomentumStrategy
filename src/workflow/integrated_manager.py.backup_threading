@@ -1,0 +1,749 @@
+"""
+Integrated Workflow Manager
+src/workflow/integrated_manager.py
+
+Orchestrates the complete investment workflow:
+1. Strategy Analysis
+2. Backtesting
+3. Portfolio Creation
+4. Live Monitoring
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import json
+import sqlite3
+
+from src.core.config import ConfigManager
+from src.core.logging import LoggerFactory
+from src.core.errors import ErrorHandler
+from src.analysis.dynamic_analyzer import DynamicStockAnalyzer, StrategyConfig
+from src.backtest.backtest_engine import EnterpriseBacktestEngine
+from src.portfolio.portfolio_manager import EnterprisePortfolioManager
+
+
+class WorkflowStatus:
+    """Track workflow execution status"""
+    PENDING = "pending"
+    ANALYZING = "analyzing"
+    BACKTESTING = "backtesting"
+    CREATING_PORTFOLIO = "creating_portfolio"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class IntegratedWorkflowManager:
+    """
+    Integrated Workflow Manager
+    
+    Features:
+    - End-to-end workflow automation
+    - Strategy comparison
+    - Workflow tracking
+    - Results persistence
+    - Decision recommendations
+    """
+    
+    def __init__(self, db_path: str = None):
+        """Initialize workflow manager"""
+        # Load configuration
+        self.config = ConfigManager()
+        
+        # Setup logging
+        self.logger = LoggerFactory.create_logger(
+            'workflow_manager',
+            self.config,
+            context={'component': 'workflow'}
+        )
+        
+        self.logger.info("Initializing Integrated Workflow Manager...")
+        
+        # Initialize components
+        self.error_handler = ErrorHandler(self.logger, self.config)
+        
+        # Database
+        if db_path is None:
+            db_path = self.config.get('database.path')
+        
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        # Enable foreign keys
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        
+        # Initialize sub-managers
+        self.analyzer = DynamicStockAnalyzer(db_path)
+        self.backtest_engine = EnterpriseBacktestEngine(db_path)
+        self.portfolio_manager = EnterprisePortfolioManager(db_path)
+        
+        # Workflow tracking
+        self._create_workflow_tables()
+        self.current_workflow = None
+        
+        self.logger.info("OK Workflow Manager initialized successfully")
+    
+    def _create_workflow_tables(self):
+        """Create workflow tracking tables"""
+        cursor = self.conn.cursor()
+        
+        # Workflows table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS workflows (
+                workflow_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_name TEXT,
+                strategy_name TEXT,
+                created_date TEXT,
+                status TEXT,
+                analysis_completed INTEGER DEFAULT 0,
+                backtest_completed INTEGER DEFAULT 0,
+                portfolio_created INTEGER DEFAULT 0,
+                analysis_id INTEGER,
+                backtest_id INTEGER,
+                portfolio_id INTEGER,
+                notes TEXT
+            )
+        ''')
+        
+        # Workflow results table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS workflow_results (
+                result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id INTEGER,
+                stage TEXT,
+                result_data TEXT,
+                created_date TEXT,
+                FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id)
+            )
+        ''')
+        
+        # Strategy comparisons table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS strategy_comparisons (
+                comparison_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                comparison_name TEXT,
+                strategies TEXT,
+                comparison_date TEXT,
+                winner_strategy TEXT,
+                comparison_metrics TEXT
+            )
+        ''')
+        
+        self.conn.commit()
+        self.logger.info("OK Workflow tables created/verified")
+    
+    def create_workflow(
+        self,
+        workflow_name: str,
+        strategy_config: StrategyConfig,
+        notes: str = None
+    ) -> int:
+        """
+        Create a new workflow
+        
+        Args:
+            workflow_name: Name for this workflow
+            strategy_config: Strategy configuration to use
+            notes: Optional notes
+        
+        Returns:
+            workflow_id
+        """
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO workflows 
+            (workflow_name, strategy_name, created_date, status, notes)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (
+            workflow_name,
+            strategy_config.config_name,
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            WorkflowStatus.PENDING,
+            notes
+        ))
+        
+        workflow_id = cursor.lastrowid
+        self.conn.commit()
+        
+        self.current_workflow = {
+            'workflow_id': workflow_id,
+            'workflow_name': workflow_name,
+            'strategy_config': strategy_config
+        }
+        
+        self.logger.info(
+            f"OK Workflow created: ID={workflow_id}, Name='{workflow_name}'"
+        )
+        
+        return workflow_id
+    
+    def run_complete_workflow(
+        self,
+        strategy_config: StrategyConfig,
+        workflow_name: str = None,
+        backtest_params: Dict = None,
+        portfolio_params: Dict = None,
+        auto_create_portfolio: bool = False
+    ) -> Dict:
+        """
+        Run complete workflow: Analysis -> Backtest -> Portfolio
+        
+        Args:
+            strategy_config: Strategy configuration
+            workflow_name: Optional workflow name
+            backtest_params: Backtesting parameters
+            portfolio_params: Portfolio creation parameters
+            auto_create_portfolio: Auto-create portfolio if backtest passes
+        
+        Returns:
+            Workflow results dictionary
+        """
+        if workflow_name is None:
+            workflow_name = f"Workflow_{strategy_config.config_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Create workflow
+        workflow_id = self.create_workflow(workflow_name, strategy_config)
+        
+        results = {
+            'workflow_id': workflow_id,
+            'workflow_name': workflow_name,
+            'strategy_name': strategy_config.config_name,
+            'stages': {}
+        }
+        
+        try:
+            # STAGE 1: Analysis
+            self.logger.info(f"[{workflow_name}] Stage 1: Running Analysis...")
+            self._update_workflow_status(workflow_id, WorkflowStatus.ANALYZING)
+            
+            analysis_results = self._run_analysis_stage(
+                workflow_id,
+                strategy_config
+            )
+            results['stages']['analysis'] = analysis_results
+            
+            if not analysis_results['success']:
+                raise Exception(f"Analysis failed: {analysis_results.get('error')}")
+            
+            # STAGE 2: Backtesting
+            self.logger.info(f"[{workflow_name}] Stage 2: Running Backtest...")
+            self._update_workflow_status(workflow_id, WorkflowStatus.BACKTESTING)
+            
+            backtest_results = self._run_backtest_stage(
+                workflow_id,
+                strategy_config,
+                backtest_params or {}
+            )
+            results['stages']['backtest'] = backtest_results
+            
+            if not backtest_results['success']:
+                raise Exception(f"Backtest failed: {backtest_results.get('error')}")
+            
+            # Decision point: Should we create portfolio?
+            should_create = auto_create_portfolio or self._evaluate_backtest_results(
+                backtest_results
+            )
+            
+            results['recommendation'] = {
+                'create_portfolio': should_create,
+                'reason': self._get_recommendation_reason(backtest_results)
+            }
+            
+            # STAGE 3: Portfolio Creation (if approved)
+            if should_create:
+                self.logger.info(f"[{workflow_name}] Stage 3: Creating Portfolio...")
+                self._update_workflow_status(workflow_id, WorkflowStatus.CREATING_PORTFOLIO)
+                
+                portfolio_results = self._run_portfolio_stage(
+                    workflow_id,
+                    strategy_config,
+                    analysis_results['top_stocks'],
+                    portfolio_params or {}
+                )
+                results['stages']['portfolio'] = portfolio_results
+            else:
+                self.logger.info(
+                    f"[{workflow_name}] Portfolio creation skipped: "
+                    f"{results['recommendation']['reason']}"
+                )
+            
+            # Mark as completed
+            self._update_workflow_status(workflow_id, WorkflowStatus.COMPLETED)
+            results['status'] = 'completed'
+            
+            # Save final results
+            self._save_workflow_results(workflow_id, results)
+            
+            self.logger.info(f"OK Workflow completed: {workflow_name}")
+            
+        except Exception as e:
+            self.logger.error(f"Workflow failed: {e}")
+            self._update_workflow_status(workflow_id, WorkflowStatus.FAILED)
+            results['status'] = 'failed'
+            results['error'] = str(e)
+            
+            self.error_handler.handle(
+                e,
+                context={'workflow_id': workflow_id, 'workflow_name': workflow_name}
+            )
+        
+        return results
+    
+    def _run_analysis_stage(
+        self,
+        workflow_id: int,
+        strategy_config: StrategyConfig
+    ) -> Dict:
+        """Run analysis stage"""
+        try:
+            # Set strategy and analyze
+            self.analyzer.set_config(strategy_config)
+            
+            # Get all stocks
+            all_results = self.analyzer.analyze_universe(show_progress=True)
+            
+            if all_results.empty:
+                return {
+                    'success': False,
+                    'error': 'No stocks found in analysis'
+                }
+            
+            # Apply filters
+            filtered_results = self.analyzer.apply_filters(all_results)
+            
+            # Select top stocks
+            top_stocks = self.analyzer.select_top_stocks(
+                filtered_results,
+                n=20,
+                method='momentum'
+            )
+            
+            # Save analysis
+            self.analyzer.save_analysis(top_stocks)
+            
+            # Update workflow
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE workflows 
+                SET analysis_completed = 1
+                WHERE workflow_id = ?
+            ''', [workflow_id])
+            self.conn.commit()
+            
+            return {
+                'success': True,
+                'total_analyzed': len(all_results),
+                'after_filters': len(filtered_results),
+                'top_stocks_count': len(top_stocks),
+                'top_stocks': top_stocks.to_dict('records'),
+                'avg_momentum': float(top_stocks['momentum_score'].mean()),
+                'avg_volatility': float(top_stocks[[col for col in top_stocks.columns if 'volatility' in col][0]].mean()) if any('volatility' in col for col in top_stocks.columns) else None
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Analysis stage failed: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _run_backtest_stage(
+        self,
+        workflow_id: int,
+        strategy_config: StrategyConfig,
+        backtest_params: Dict
+    ) -> Dict:
+        """Run backtesting stage"""
+        try:
+            # Default parameters
+            params = {
+                'start_date': '2020-01-01',
+                'end_date': datetime.now().strftime('%Y-%m-%d'),
+                'initial_capital': 1000000,
+                'rebalance_frequency': '6M',
+                'n_stocks': 15,
+                'allocation_method': 'risk_parity'
+            }
+            params.update(backtest_params)
+            
+            # Run backtest
+            backtest_results = self.backtest_engine.run_backtest(
+                strategy_config=strategy_config,
+                **params
+            )
+            
+            # Calculate metrics
+            metrics = self.backtest_engine.calculate_metrics()
+            
+            # Export results
+            self.backtest_engine.export_results(
+                filename_prefix=f"workflow_{workflow_id}_backtest"
+            )
+            
+            # Update workflow
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE workflows 
+                SET backtest_completed = 1
+                WHERE workflow_id = ?
+            ''', [workflow_id])
+            self.conn.commit()
+            
+            return {
+                'success': True,
+                'metrics': metrics,
+                'final_value': backtest_results['final_value'],
+                'total_return': backtest_results['total_return'],
+                'cagr': backtest_results['cagr'],
+                'parameters': params
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Backtest stage failed: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _run_portfolio_stage(
+        self,
+        workflow_id: int,
+        strategy_config: StrategyConfig,
+        top_stocks: List[Dict],
+        portfolio_params: Dict
+    ) -> Dict:
+        """Run portfolio creation stage"""
+        try:
+            # Default parameters
+            params = {
+                'initial_capital': 1000000,
+                'allocation_method': 'risk_parity'
+            }
+            params.update(portfolio_params)
+            
+            # Prepare stocks DataFrame
+            stocks_df = pd.DataFrame(top_stocks)
+            
+            # Calculate position sizes
+            positions = self.portfolio_manager.calculate_position_sizes(
+                stocks_df,
+                capital=params['initial_capital'],
+                method=params['allocation_method']
+            )
+            
+            # Create portfolio
+            portfolio_id = self.portfolio_manager.create_portfolio(
+                positions,
+                portfolio_name=f"Workflow_{workflow_id}_Portfolio",
+                initial_capital=params['initial_capital'],
+                allocation_method=params['allocation_method']
+            )
+            
+            # Update workflow
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE workflows 
+                SET portfolio_created = 1,
+                    portfolio_id = ?
+                WHERE workflow_id = ?
+            ''', [portfolio_id, workflow_id])
+            self.conn.commit()
+            
+            # Get portfolio summary
+            summary = self.portfolio_manager.get_portfolio_summary(portfolio_id)
+            
+            return {
+                'success': True,
+                'portfolio_id': portfolio_id,
+                'summary': summary,
+                'parameters': params
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Portfolio stage failed: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _evaluate_backtest_results(self, backtest_results: Dict) -> bool:
+        """
+        Evaluate if backtest results warrant portfolio creation
+        
+        Criteria:
+        - Positive CAGR
+        - Sharpe Ratio > 1.0
+        - Max Drawdown < -25%
+        - Total Return > 15%
+        """
+        if not backtest_results['success']:
+            return False
+        
+        metrics = backtest_results['metrics']
+        
+        checks = {
+            'positive_cagr': metrics.get('CAGR (%)', 0) > 0,
+            'good_sharpe': metrics.get('Sharpe Ratio', 0) > 1.0,
+            'acceptable_drawdown': metrics.get('Max Drawdown (%)', -100) > -25,
+            'good_return': metrics.get('Total Return (%)', 0) > 15
+        }
+        
+        # Need at least 3 out of 4 criteria
+        passed = sum(checks.values()) >= 3
+        
+        self.logger.info(f"Backtest evaluation: {checks}, Passed: {passed}")
+        
+        return passed
+    
+    def _get_recommendation_reason(self, backtest_results: Dict) -> str:
+        """Get recommendation reason based on backtest"""
+        if not backtest_results['success']:
+            return "Backtest failed to complete"
+        
+        metrics = backtest_results['metrics']
+        cagr = metrics.get('CAGR (%)', 0)
+        sharpe = metrics.get('Sharpe Ratio', 0)
+        mdd = metrics.get('Max Drawdown (%)', -100)
+        
+        if cagr > 20 and sharpe > 1.5:
+            return "Excellent performance: High CAGR and Sharpe Ratio"
+        elif cagr > 15 and sharpe > 1.0:
+            return "Good performance: Solid CAGR and risk-adjusted returns"
+        elif mdd < -25:
+            return "High drawdown risk: Consider revising strategy"
+        elif sharpe < 1.0:
+            return "Poor risk-adjusted returns: Consider alternative strategies"
+        else:
+            return "Moderate performance: Review parameters carefully"
+    
+    def _update_workflow_status(self, workflow_id: int, status: str):
+        """Update workflow status"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE workflows SET status = ? WHERE workflow_id = ?
+        ''', [status, workflow_id])
+        self.conn.commit()
+    
+    def _save_workflow_results(self, workflow_id: int, results: Dict):
+        """Save workflow results to database"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO workflow_results 
+            (workflow_id, stage, result_data, created_date)
+            VALUES (?, ?, ?, ?)
+        ''', (
+            workflow_id,
+            'complete',
+            json.dumps(results, default=str),
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ))
+        
+        self.conn.commit()
+    
+    def compare_strategies(
+        self,
+        strategies: List[StrategyConfig],
+        comparison_name: str,
+        backtest_params: Dict = None
+    ) -> Dict:
+        """
+        Compare multiple strategies side-by-side
+        
+        Args:
+            strategies: List of strategy configurations
+            comparison_name: Name for this comparison
+            backtest_params: Common backtest parameters
+        
+        Returns:
+            Comparison results
+        """
+        self.logger.info(f"Starting strategy comparison: {len(strategies)} strategies")
+        
+        results = {
+            'comparison_name': comparison_name,
+            'comparison_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'strategies': []
+        }
+        
+        for strategy_config in strategies:
+            self.logger.info(f"Evaluating strategy: {strategy_config.config_name}")
+            
+            # Run workflow without portfolio creation
+            workflow_results = self.run_complete_workflow(
+                strategy_config=strategy_config,
+                workflow_name=f"Comparison_{comparison_name}_{strategy_config.config_name}",
+                backtest_params=backtest_params,
+                auto_create_portfolio=False
+            )
+            
+            # Extract key metrics
+            strategy_summary = {
+                'strategy_name': strategy_config.config_name,
+                'workflow_id': workflow_results['workflow_id']
+            }
+            
+            if 'backtest' in workflow_results['stages']:
+                backtest = workflow_results['stages']['backtest']
+                if backtest['success']:
+                    strategy_summary.update({
+                        'cagr': backtest['metrics'].get('CAGR (%)', 0),
+                        'sharpe': backtest['metrics'].get('Sharpe Ratio', 0),
+                        'max_drawdown': backtest['metrics'].get('Max Drawdown (%)', 0),
+                        'total_return': backtest['metrics'].get('Total Return (%)', 0),
+                        'volatility': backtest['metrics'].get('Volatility (%)', 0),
+                        'win_rate': backtest['metrics'].get('Win Rate (%)', 0)
+                    })
+            
+            results['strategies'].append(strategy_summary)
+        
+        # Determine winner
+        if results['strategies']:
+            # Rank by Sharpe Ratio
+            winner = max(
+                results['strategies'],
+                key=lambda x: x.get('sharpe', -999)
+            )
+            results['winner'] = winner['strategy_name']
+            results['winner_sharpe'] = winner.get('sharpe')
+        
+        # Save comparison
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO strategy_comparisons 
+            (comparison_name, strategies, comparison_date, winner_strategy, comparison_metrics)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (
+            comparison_name,
+            json.dumps([s.config_name for s in strategies]),
+            results['comparison_date'],
+            results.get('winner'),
+            json.dumps(results, default=str)
+        ))
+        self.conn.commit()
+        
+        self.logger.info(f"OK Comparison complete. Winner: {results.get('winner')}")
+        
+        return results
+    
+    def get_workflow_history(self, limit: int = 10) -> pd.DataFrame:
+        """Get recent workflow history"""
+        query = '''
+            SELECT 
+                workflow_id,
+                workflow_name,
+                strategy_name,
+                created_date,
+                status,
+                analysis_completed,
+                backtest_completed,
+                portfolio_created
+            FROM workflows
+            ORDER BY created_date DESC
+            LIMIT ?
+        '''
+        
+        return pd.read_sql_query(query, self.conn, params=[limit])
+    
+    def get_workflow_details(self, workflow_id: int) -> Dict:
+        """Get detailed workflow information"""
+        cursor = self.conn.cursor()
+        
+        # Get workflow info
+        cursor.execute('''
+            SELECT * FROM workflows WHERE workflow_id = ?
+        ''', [workflow_id])
+        
+        workflow_row = cursor.fetchone()
+        if not workflow_row:
+            return None
+        
+        # Get results
+        cursor.execute('''
+            SELECT stage, result_data, created_date
+            FROM workflow_results
+            WHERE workflow_id = ?
+            ORDER BY created_date
+        ''', [workflow_id])
+        
+        results = cursor.fetchall()
+        
+        return {
+            'workflow_info': dict(zip([col[0] for col in cursor.description], workflow_row)),
+            'results': [
+                {
+                    'stage': r[0],
+                    'data': json.loads(r[1]) if r[1] else None,
+                    'date': r[2]
+                }
+                for r in results
+            ]
+        }
+    
+    def close(self):
+        """Close all connections"""
+        self.analyzer.close()
+        self.backtest_engine.close()
+        self.portfolio_manager.close()
+        self.conn.close()
+        self.logger.info("Workflow Manager closed")
+
+
+# Usage example
+if __name__ == "__main__":
+    from src.analysis.dynamic_analyzer import PresetStrategies
+    
+    # Initialize workflow manager
+    wfm = IntegratedWorkflowManager()
+    
+    # Example 1: Run complete workflow
+    print("="*80)
+    print("EXAMPLE 1: Complete Workflow")
+    print("="*80)
+    
+    strategy = PresetStrategies.balanced_momentum()
+    
+    results = wfm.run_complete_workflow(
+        strategy_config=strategy,
+        workflow_name="Demo_Balanced_Strategy",
+        backtest_params={
+            'start_date': '2020-01-01',
+            'initial_capital': 1000000,
+            'rebalance_frequency': '6M'
+        },
+        auto_create_portfolio=False  # Manual approval
+    )
+    
+    print(f"\nWorkflow Status: {results['status']}")
+    print(f"Recommendation: {results['recommendation']}")
+    
+    # Example 2: Compare strategies
+    print("\n" + "="*80)
+    print("EXAMPLE 2: Strategy Comparison")
+    print("="*80)
+    
+    strategies_to_compare = [
+        PresetStrategies.balanced_momentum(),
+        PresetStrategies.short_term_momentum(),
+        PresetStrategies.classic_momentum()
+    ]
+    
+    comparison = wfm.compare_strategies(
+        strategies=strategies_to_compare,
+        comparison_name="Q4_2024_Strategy_Review",
+        backtest_params={'start_date': '2020-01-01'}
+    )
+    
+    print(f"\nWinner: {comparison.get('winner')}")
+    print(f"Sharpe Ratio: {comparison.get('winner_sharpe')}")
+    
+    # Example 3: View history
+    print("\n" + "="*80)
+    print("EXAMPLE 3: Workflow History")
+    print("="*80)
+    
+    history = wfm.get_workflow_history(limit=5)
+    print(history.to_string())
+    
+    wfm.close()

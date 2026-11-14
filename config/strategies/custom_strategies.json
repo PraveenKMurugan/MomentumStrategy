@@ -1,0 +1,40 @@
+{
+  "config_name": "My_Custom_Strategy",
+  "description": "Template for creating custom strategies",
+  "universe": "NIFTY500",
+  "custom_symbols": null,
+  "performance_periods": {
+    "6M": {
+      "days": 126,
+      "weight": 0.6,
+      "description": "6 month return with 60% weight"
+    },
+    "3M": {
+      "days": 63,
+      "weight": 0.4,
+      "description": "3 month return with 40% weight"
+    }
+  },
+  "volatility_periods": {
+    "6M_vol": 126
+  },
+  "momentum_weights": {
+    "6M": 0.6,
+    "3M": 0.4
+  },
+  "filters": {
+    "volume": {
+      "min_value": 100000,
+      "description": "Minimum daily trading volume"
+    },
+    "volatility": {
+      "max_value": 55,
+      "description": "Maximum annualized volatility %"
+    },
+    "momentum": {
+      "min_value": 8,
+      "description": "Minimum momentum score"
+    }
+  },
+  "notes": "Modify this template to create your own strategies"
+}
